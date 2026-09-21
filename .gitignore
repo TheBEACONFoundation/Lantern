@@ -1,0 +1,22 @@
+# Build output. `./build.sh` regenerates all of it, including the icon.
+build/
+
+# A packaged snapshot of the project taken for a handover. It is a second,
+# older copy of everything in Sources/ — publishing it would put stale code
+# beside the real thing. HANDOFF.md at the top level is the notes worth
+# keeping; this directory is not.
+handoff/
+
+# docs/ is NOT ignored: the README's images live there and `--export-docs`
+# regenerates them.
+
+# macOS and editor noise.
+.DS_Store
+*.swp
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+.swiftpm/
+DerivedData/

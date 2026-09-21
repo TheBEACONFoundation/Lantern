@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Must be Apple silicon. `build.sh` compiles for arm64-apple-macos13.0 and
+    # then *runs* the binary it just built to render the app icon, so an Intel
+    # runner would compile fine and fail at the icon step.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: swift --version && uname -m
+
+      - name: Build
+        # Needs only the Command Line Tools: no Xcode project, no packages,
+        # nothing to resolve or cache.
+        run: ./build.sh
+
+      - name: Oath, gate and battery-tier cases
+        # 137 cases, no microphone and no display needed — the flag returns
+        # before AppKit is ever brought up.
+        run: build/Lantern.app/Contents/MacOS/Lantern --test-oath
+
+      - name: Renderers
+        # A smoke test that every emblem still draws. Catches a bad path or a
+        # divide-by-zero in geometry that the matcher cases would not.
+        run: |
+          build/Lantern.app/Contents/MacOS/Lantern --export-preview "$RUNNER_TEMP/states.png"
+          build/Lantern.app/Contents/MacOS/Lantern --export-docs "$RUNNER_TEMP/docs"
+          ls -l "$RUNNER_TEMP/states.png" "$RUNNER_TEMP/docs"
+
+# Deliberately no release artifact. The bundle is ad-hoc signed, so a download
+# would trip Gatekeeper on any machine but the one that built it; the README
+# tells people to build it themselves instead.
