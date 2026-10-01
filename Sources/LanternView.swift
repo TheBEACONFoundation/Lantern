@@ -44,6 +44,7 @@ final class LanternView: NSView {
     /// bloom, which it *snuffs* rather than spikes. For the four corps an oath
     /// is the only way into, that was every single time.
     func triggerOathFlare() {
+        guard !reduceMotion else { return }
         if CACurrentMediaTime() - lastFlourish > 0.25 {
             fireShockwave()
             flareGlow(duration: 2.4)
@@ -81,11 +82,24 @@ final class LanternView: NSView {
 
     private var hovering = false { didSet { update() } }
     private var tracking: NSTrackingArea?
+    private let reduceMotionPreference: () -> Bool
+    private var reduceMotion: Bool
+    private var accessibilityObserver: NSObjectProtocol?
 
     override var isFlipped: Bool { false }
     override var isOpaque: Bool { false }
 
-    override init(frame: NSRect) {
+    override convenience init(frame: NSRect) {
+        self.init(frame: frame, reduceMotionPreference: {
+            NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        })
+    }
+
+    /// The preference provider also lets rendering checks exercise accessibility
+    /// changes without changing the user's system settings.
+    init(frame: NSRect, reduceMotionPreference: @escaping () -> Bool) {
+        self.reduceMotionPreference = reduceMotionPreference
+        reduceMotion = reduceMotionPreference()
         super.init(frame: frame)
         // Layer-hosting: the view owns this tree outright and never draws.
         let root = CALayer()
@@ -95,8 +109,36 @@ final class LanternView: NSView {
         layerContentsRedrawPolicy = .never
         assembleTree(in: root)
         update(force: true)
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in self?.refreshMotionPreference() }
     }
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    deinit {
+        if let accessibilityObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver)
+        }
+    }
+
+    private func refreshMotionPreference() {
+        let preference = reduceMotionPreference()
+        guard preference != reduceMotion else { return }
+        reduceMotion = preference
+        if reduceMotion {
+            // Cancel transitions already in flight, including the shape mask,
+            // before rebuilding the static indicators for the current state.
+            if let layer { stopAnimations(in: layer) }
+        }
+        update()
+    }
+
+    private func stopAnimations(in layer: CALayer) {
+        layer.removeAllAnimations()
+        if let mask = layer.mask { stopAnimations(in: mask) }
+        layer.sublayers?.forEach { stopAnimations(in: $0) }
+    }
 
     private func assembleTree(in root: CALayer) {
         root.addSublayer(emblemRoot)
@@ -232,6 +274,7 @@ final class LanternView: NSView {
     }
     private struct MotionKey: Equatable {
         var canvas: CGSize, mode: Mode, low: Bool, glint: Bool, particles: Bool
+        var reduceMotion: Bool
     }
     private struct CaptionKey: Equatable {
         var bounds: CGRect, scale: CGFloat, text: String
@@ -248,7 +291,13 @@ final class LanternView: NSView {
     /// mode does. A reading that changes nothing visible costs nothing.
     private func update(force: Bool = false) {
         guard bounds.width > 1 else { return }
-        if force { artKey = nil; motionKey = nil; captionKey = nil }
+        if force {
+            // Resizes and display changes rebuild at a new geometry or scale.
+            // A dissolve's outgoing bitmap and a flourish's old positions no
+            // longer fit; clear those before restarting the ambient motion.
+            if let layer { stopAnimations(in: layer) }
+            artKey = nil; motionKey = nil; captionKey = nil
+        }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -292,7 +341,7 @@ final class LanternView: NSView {
         // wrong shape to cross-fade against.
         let entered: LanternGlyph.Emblem? =
             (previous != nil && figureChanged && !geometryChanged) ? p.emblem : nil
-        shift = entered.map { CorpsShift(dissolve: dissolveTime(for: $0)) }
+        shift = reduceMotion ? nil : entered.map { CorpsShift(dissolve: dissolveTime(for: $0)) }
 
         /// Swaps a layer's artwork, dissolving into it during a corps shift.
         /// `contents` is animatable, so handing Core Animation the outgoing
@@ -559,7 +608,10 @@ final class LanternView: NSView {
     /// these are plain property sets, so they never restart an animation.
     private func placeEmitters() {
         let e = LanternGlyph.emblemBounds(in: local), r = e.width / 2
-        let on = Settings.shared.particleEffects
+        let on = Settings.shared.particleEffects && !reduceMotion
+        emberEmitter.isHidden = !on
+        burstEmitter.isHidden = !on
+        if !on { burstEmitter.birthRate = 0 }
         let fillH = max(1, level * e.height)
         emberEmitter.emitterPosition = CGPoint(x: e.midX, y: e.minY + fillH / 2)
         emberEmitter.emitterSize = CGSize(width: e.width * 0.78, height: fillH)
@@ -581,6 +633,7 @@ final class LanternView: NSView {
     }
 
     private func fireBurst() {
+        guard !reduceMotion else { return }
         burstEmitter.beginTime = burstEmitter.convertTime(CACurrentMediaTime(), from: nil)
         burstEmitter.birthRate = 1
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
@@ -597,7 +650,8 @@ final class LanternView: NSView {
     private func configureMotionIfNeeded() {
         let key = MotionKey(canvas: bounds.size, mode: mode, low: lowBattery,
                             glint: level > 0.5 || mode == .charging,
-                            particles: Settings.shared.particleEffects)
+                            particles: Settings.shared.particleEffects && !reduceMotion,
+                            reduceMotion: reduceMotion)
         guard key != motionKey else { return }
         motionKey = key
 
@@ -606,8 +660,10 @@ final class LanternView: NSView {
 
         // The liquid surface slides one period and loops.
         let period = r * 2
-        for strip in [litStrip] {
-            strip.removeAllAnimations()
+        litStrip.removeAnimation(forKey: "slide")
+        litStrip.removeAnimation(forKey: "breath")
+        if !reduceMotion {
+            let strip = litStrip
             let slide = CABasicAnimation(keyPath: "position.x")
             slide.fromValue = 0
             slide.toValue = -period
@@ -629,9 +685,9 @@ final class LanternView: NSView {
         }
 
         // Surge: a band of light climbing the emblem.
-        surgeLayer.removeAllAnimations()
-        surgeLayer.isHidden = !charging
-        if charging {
+        surgeLayer.removeAnimation(forKey: "surge")
+        surgeLayer.isHidden = !charging || reduceMotion
+        if charging && !reduceMotion {
             surgeLayer.position = CGPoint(x: e.midX, y: e.minY)
             let climb = CABasicAnimation(keyPath: "position.y")
             climb.fromValue = e.minY - r * 0.3
@@ -648,10 +704,10 @@ final class LanternView: NSView {
         }
 
         // Ring sweep: a fast comet while charging, a slow shimmer when full.
-        for l in [sweepLayer, sweepHaloLayer] { l.removeAllAnimations() }
+        for l in [sweepLayer, sweepHaloLayer] { l.removeAnimation(forKey: "spin") }
         sweepLayer.isHidden = !(charging || mode == .topped)
         sweepHaloLayer.isHidden = !charging
-        if charging || mode == .topped {
+        if !reduceMotion && (charging || mode == .topped) {
             let spin = CABasicAnimation(keyPath: "transform.rotation.z")
             spin.fromValue = 0
             spin.toValue = 2 * CGFloat.pi
@@ -663,22 +719,24 @@ final class LanternView: NSView {
         }
 
         // Held back: the ring breathes, waiting.
-        heldLayer.removeAllAnimations()
+        heldLayer.removeAnimation(forKey: "pulse")
         heldLayer.isHidden = mode != .held
-        if mode == .held {
+        heldLayer.opacity = 0.255
+        if mode == .held && !reduceMotion {
             heldLayer.add(pulse(from: 0.169, to: 0.342, half: .pi / 1.15), forKey: "pulse")
         }
 
         // Hub glint, quicker while charging.
-        glintLayer.removeAllAnimations()
+        glintLayer.removeAnimation(forKey: "pulse")
         glintLayer.isHidden = !key.glint
-        if key.glint {
+        glintLayer.opacity = 0.339
+        if key.glint && !reduceMotion {
             glintLayer.add(pulse(from: 0.271, to: 0.407, half: .pi / (charging ? 3.4 : 1.2)),
                            forKey: "pulse")
         }
 
         // The hub flickers as it swallows motes.
-        coreFlashLayer.removeAllAnimations()
+        coreFlashLayer.removeAnimation(forKey: "flicker")
         coreFlashLayer.isHidden = !(charging && key.particles)
         if charging && key.particles {
             let flicker = CAKeyframeAnimation(keyPath: "opacity")
@@ -701,7 +759,7 @@ final class LanternView: NSView {
 
         // Low battery breathes, so it catches the eye.
         glowLayer.removeAnimation(forKey: "breathe")
-        if key.low {
+        if key.low && !reduceMotion {
             let breathe = CABasicAnimation(keyPath: "opacity")
             breathe.isAdditive = true
             breathe.fromValue = -0.25 * glowBase
@@ -735,6 +793,7 @@ final class LanternView: NSView {
 
     /// A glow spike that decays back to rest — on plug-in, and on the oath.
     private func flareGlow(duration: CFTimeInterval) {
+        guard !reduceMotion else { return }
         let spike = CABasicAnimation(keyPath: "opacity")
         spike.isAdditive = true
         spike.fromValue = 1 - glowBase
@@ -748,6 +807,7 @@ final class LanternView: NSView {
     /// Sharing the "flare" key means one replaces the other rather than the
     /// two fighting over the layer.
     private func snuffGlow(duration: CFTimeInterval) {
+        guard !reduceMotion else { return }
         let snuff = CABasicAnimation(keyPath: "opacity")
         snuff.isAdditive = true
         snuff.fromValue = -glowBase
@@ -762,6 +822,7 @@ final class LanternView: NSView {
     /// defaults are the oath's; a corps shift asks for its own count and pace.
     private func fireShockwave(count: Int = 3, duration: CFTimeInterval = 2.4,
                                stagger: CFTimeInterval = 0.384, alpha: Float = 0.75) {
+        guard !reduceMotion else { return }
         let r = LanternGlyph.emblemBounds(in: local).width / 2
         let now = CACurrentMediaTime()
         for (i, wave) in shockwaves.enumerated() {
@@ -825,6 +886,7 @@ final class LanternView: NSView {
     /// under it. Applied to the emblem and the caption together, so the
     /// number goes with the lantern rather than sitting steady beside it.
     private func flourish(_ emblem: LanternGlyph.Emblem) {
+        guard !reduceMotion else { return }
         lastFlourish = CACurrentMediaTime()
         let r = LanternGlyph.emblemBounds(in: local).width / 2
 

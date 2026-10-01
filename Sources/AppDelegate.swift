@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: DesktopWindow!
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
+    private lazy var oathReference = OathReferenceWindowController()
 
     private let settings = Settings.shared
 
@@ -96,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        oath.stop()
         monitor.stop()
     }
 
@@ -250,6 +252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         menu.addItem(.separator())
         menu.addItem(section("The Oath"))
+        menu.addItem(item("View All Oaths…", #selector(showOathReference)))
         oathRow.toggle.target = self
         oathRow.toggle.action = #selector(toggleOathListening)
         menu.addItem(row(oathRow))
@@ -358,6 +361,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    @objc private func showOathReference() {
+        oathReference.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        oathReference.window?.makeKeyAndOrderFront(nil)
+    }
+
     @objc private func toggleLaunchAtLogin() {
         let service = SMAppService.mainApp
         do {
@@ -387,7 +396,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .requestingPermission: return "Asking for microphone access…"
         case .denied(let why): return why
         case .unavailable(let why): return why
-        case .listening: return "Listening for any of the three oaths…"
+        case .listening: return "Listening for an oath…"
         case .heard(let text): return "Heard: \(text.suffix(46))"
         case .accepted(let corps): return "Sworn to the \(corps)"
         }

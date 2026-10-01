@@ -31,7 +31,7 @@ swiftc \
   -target arm64-apple-macos13.0 \
   -framework IOKit \
   -o "$BUILD_DIR/lantern-probe" \
-  Sources/SMC.swift Probe/main.swift
+  Sources/SMC.swift Probe/ProbeSupport.swift Probe/main.swift
 
 echo "==> Info.plist"
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -52,7 +52,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <!-- Menu-bar accessory: no Dock icon, no main menu. -->
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Lantern listens for the Oath of the Lantern to unseal charging. Recognition runs entirely on this Mac.</string>
+    <string>Lantern listens for a Lantern Corps oath to change the emblem. Recognition runs entirely on this Mac; battery charging is not changed.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>Lantern recognises the Oath of the Lantern on-device. No audio leaves this Mac.</string>
 </dict>

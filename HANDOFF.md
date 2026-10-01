@@ -108,6 +108,12 @@ invisible on a dark desktop anyway.
 - **Recognition ends a session after a beat of silence.** An oath recited with
   pauses used to arrive in pieces, none of which was an oath. `OathListener`
   carries each finished piece for 25 seconds and matches it with what follows.
+  Each piece has its own expiry, and asynchronous callbacks are scoped to the
+  listening session that created them. Indigo needs a recognized closing
+  phrase plus "lantern" or "Abin Sur"; its last line alone is insufficient.
+- **Reduce Motion is live.** The widget follows the macOS accessibility
+  preference, including when it changes while running. Static battery and
+  charging indicators remain visible; moving effects stop.
 - **This macOS draws no icons on plain menu items.** Setting `NSMenuItem.image`
   does nothing, confirmed with a bare test menu. Custom row views can draw
   their own.
@@ -129,7 +135,9 @@ laziness:
   `CHIE` was found.
 - If you revisit this: watch `ExternalConnected` in `ioreg -rn AppleSmartBattery`
   while testing a key, not just `IsCharging`. That distinction is what the probe
-  missed.
+  originally missed. It now reports charger disconnection separately, verifies
+  restores by reading the original value back, and stops on restoration errors.
+  `./test-probe.sh` exercises parsing and recovery using a fake SMC, without root.
 
 ## Not done yet
 

@@ -1,4 +1,3 @@
-import AVFoundation
 import Foundation
 import Speech
 
@@ -37,7 +36,7 @@ final class OathListener {
         let spokenName: String?
         /// At least one of these must appear, or the name must be heard. It
         /// stops a stray phrase from tripping the gate, and it is what tells
-        /// the three oaths apart when recognition garbles the rest.
+        /// the corps' oaths apart when recognition garbles the rest.
         ///
         /// None of them may be a proper noun on its own: an oath that hangs on
         /// a word the recogniser doesn't know can't be said at all.
@@ -198,14 +197,9 @@ final class OathListener {
                        "join our fight", "love conquers all", "violet light"],
              required: 4),
 
-        // The Indigo Tribe's oath is in a language no recogniser has ever
-        // heard, so there is no coverage to measure — nine words in ten come
-        // back as noise. The whole of the match is its last line, which
-        // arrives as "for morrow sir" or near enough, hence a bar of one where
-        // every other oath needs four. The three spellings below are what the
-        // recogniser actually reaches for: "sir", "sur" and "sure", with or
-        // without the "for" run into it, and "tomorrow" for "formorrow" —
-        // every one of them still contains "morrow s…".
+        // Most of this oath is invented language. Require an explicit closing
+        // variant plus a recognisable word from its earlier line. The closing
+        // alone can be ordinary speech ("tomorrow, sir"), and must not swear.
         Oath(corps: .indigo,
              name: "Indigo Tribe",
              text: """
@@ -213,9 +207,10 @@ final class OathListener {
                  lantern ker lo Abin Sur, taan lek lek nok — Formorrow Sur!
                  """,
              spokenName: nil,
-             clinchers: ["morrow sir", "morrow sur", "morrow sure"],
-             phrases: ["morrow sir", "morrow sur", "morrow sure", "lantern",
-                       "abin sur"],
+             clinchers: ["formorrow", "for morrow", "tomorrow", "for tomorrow"].flatMap { first in
+                 ["sir", "sur", "sure"].map { first + " " + $0 }
+             },
+             phrases: ["lantern", "abin sur"],
              required: 1),
     ]
 
@@ -226,12 +221,28 @@ final class OathListener {
         didSet { if state != oldValue { onStateChange?(state) } }
     }
 
-    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-    private let engine = AVAudioEngine()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
+    private let input: OathSpeechInput
+    private let now: () -> TimeInterval
+    private let deliver: (@escaping () -> Void) -> Void
+    private let schedule: (TimeInterval, DispatchWorkItem) -> Void
     private var wantsToListen = false
     private var restartWork: DispatchWorkItem?
+    // A callback belongs to one permission attempt, recognition session, or
+    // pending restart. Invalidating it precedes cancellation, which can itself
+    // deliver a callback from the old task.
+    private var generation: UInt = 0
+
+    init(input: OathSpeechInput = SystemOathSpeechInput(),
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         deliver: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
+         schedule: @escaping (TimeInterval, DispatchWorkItem) -> Void = {
+             DispatchQueue.main.asyncAfter(deadline: .now() + $0, execute: $1)
+         }) {
+        self.input = input
+        self.now = now
+        self.deliver = deliver
+        self.schedule = schedule
+    }
 
     var isListening: Bool { wantsToListen }
 
@@ -258,6 +269,7 @@ final class OathListener {
     static let contextualStrings = [
         "Sinestro", "Sinestro Corps", "Green Lantern Corps", "Red Lantern Corps",
         "blackest day", "brightest night", "crimson red", "hellish hate",
+        "Abin Sur", "Formorrow Sur",
     ]
 
     /// True when some word, or some pair of adjacent words, is within a couple
@@ -286,7 +298,7 @@ final class OathListener {
     }
 
     /// Levenshtein distance, abandoned once it passes `limit` — the caller only
-    /// ever asks whether it is within one, so there is no point finishing.
+    /// needs to know whether it falls within that limit.
     private static func editDistance(_ a: [Character], _ b: [Character], limit: Int) -> Int {
         if a.isEmpty { return b.count }
         if b.isEmpty { return a.count }
@@ -307,22 +319,23 @@ final class OathListener {
         return previous[b.count]
     }
 
-    /// How many times `needle` appears, counted left to right without overlap.
+    /// Count complete words, not fragments such as "mine" inside "examine".
     private static func occurrences(of needle: String, in haystack: String) -> Int {
-        guard !needle.isEmpty else { return 0 }
-        var count = 0
-        var rest = Substring(haystack)
-        while let found = rest.range(of: needle) {
-            count += 1
-            rest = rest[found.upperBound...]
-        }
-        return count
+        haystack.split(separator: " ").filter { $0 == needle }.count
+    }
+
+    private static func containsPhrase(_ phrase: String, in normalized: String) -> Bool {
+        let padded = " " + normalized + " "
+        if padded.contains(" " + phrase + " ") { return true }
+        // Normalisation drops the apostrophe in the canonical "Lantern's".
+        // Accept that one explicit spelling without allowing arbitrary suffixes.
+        return phrase == "green lantern" && padded.contains(" green lanterns ")
     }
 
     /// How much of an oath a transcript covers: its phrases, plus its name if
     /// that was heard at all.
     private static func hits(_ oath: Oath, in normalized: String) -> Int {
-        var count = oath.phrases.filter { normalized.contains($0) }.count
+        var count = oath.phrases.filter { containsPhrase($0, in: normalized) }.count
         if let spoken = oath.spokenName, heardName(spoken, in: normalized) { count += 1 }
         return count
     }
@@ -340,7 +353,7 @@ final class OathListener {
             if let refrain = oath.refrain,
                occurrences(of: refrain.word, in: n) < refrain.atLeast { continue }
             let named = oath.spokenName.map { heardName($0, in: n) } ?? false
-            guard named || oath.clinchers.contains(where: { n.contains($0) }) else { continue }
+            guard named || oath.clinchers.contains(where: { containsPhrase($0, in: n) }) else { continue }
             let score = hits(oath, in: n)
             guard score >= oath.required else { continue }
             if score > (best?.hits ?? 0) { best = (oath, score) }
@@ -353,20 +366,18 @@ final class OathListener {
     /// recited with pauses between its lines arrives in pieces; each piece is
     /// kept for a short while and matched together with what follows, so the
     /// oath still lands as one thing.
-    private var carried = ""
-    private var carriedAt = Date.distantPast
+    private struct Fragment {
+        let text: String
+        let recordedAt: TimeInterval
+    }
+    private var carried: [Fragment] = []
     /// How long a piece stays worth carrying. Long enough to finish an oath
     /// around a pause, short enough that half an oath can't combine with
     /// something said minutes later.
     private static let carryWindow: TimeInterval = 25
 
-    private var carriedIsFresh: Bool {
-        !carried.isEmpty && Date().timeIntervalSince(carriedAt) < Self.carryWindow
-    }
-
     private func clearCarried() {
-        carried = ""
-        carriedAt = .distantPast
+        carried.removeAll()
     }
 
     /// Feeds a transcript through the matcher and, if it lands, swears to that
@@ -377,14 +388,17 @@ final class OathListener {
     /// included — can be exercised without a microphone.
     @discardableResult
     func consider(_ transcript: String, finalised: Bool = false) -> Oath? {
-        let whole = carriedIsFresh ? carried + " " + transcript : transcript
+        let time = now()
+        carried.removeAll { time - $0.recordedAt >= Self.carryWindow || time < $0.recordedAt }
+        let whole = (carried.map(\.text) + [transcript]).joined(separator: " ")
         guard let oath = Self.match(whole) else {
             if finalised, !transcript.isEmpty {
                 // Bounded, so a long spell of talking near the Mac can't grow
                 // without limit — an oath is far shorter than this.
-                carried = String((carriedIsFresh ? carried + " " + transcript : transcript)
-                    .suffix(400))
-                carriedAt = Date()
+                carried.append(Fragment(text: String(transcript.suffix(400)), recordedAt: time))
+                while carried.map({ $0.text.count + 1 }).reduce(0, +) > 401 {
+                    carried.removeFirst()
+                }
             }
             return nil
         }
@@ -396,17 +410,24 @@ final class OathListener {
 
     // MARK: - Lifecycle
 
+    private func isCurrent(_ token: UInt) -> Bool {
+        wantsToListen && generation == token
+    }
+
     func start() {
         guard !wantsToListen else { return }
+        generation &+= 1
+        let token = generation
         wantsToListen = true
         state = .requestingPermission
+        guard isCurrent(token) else { return }
 
-        SFSpeechRecognizer.requestAuthorization { [weak self] auth in
-            DispatchQueue.main.async {
-                guard let self, self.wantsToListen else { return }
+        input.requestSpeechAuthorization { [weak self] auth in
+            self?.deliver { [weak self] in
+                guard let self, self.isCurrent(token) else { return }
                 switch auth {
                 case .authorized:
-                    self.requestMicrophone()
+                    self.requestMicrophone(token: token)
                 case .denied:
                     self.fail(.denied("Speech recognition was denied. Enable it in System Settings › Privacy & Security › Speech Recognition."))
                 case .restricted:
@@ -421,26 +442,28 @@ final class OathListener {
     }
 
     func stop() {
-        wantsToListen = false
-        restartWork?.cancel()
-        restartWork = nil
-        teardownAudio()
-        // Switching off starts the next oath from silence, not from half of
-        // whatever was said before.
-        clearCarried()
+        endListening()
         state = .off
     }
 
-    private func fail(_ s: State) {
+    private func endListening() {
+        generation &+= 1
         wantsToListen = false
-        teardownAudio()
+        restartWork?.cancel()
+        restartWork = nil
+        input.stop()
+        clearCarried()
+    }
+
+    private func fail(_ s: State) {
+        endListening()
         state = s
     }
 
-    private func requestMicrophone() {
-        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            DispatchQueue.main.async {
-                guard let self, self.wantsToListen else { return }
+    private func requestMicrophone(token: UInt) {
+        input.requestMicrophoneAccess { [weak self] granted in
+            self?.deliver { [weak self] in
+                guard let self, self.isCurrent(token) else { return }
                 guard granted else {
                     self.fail(.denied("Microphone access was denied. Enable it in System Settings › Privacy & Security › Microphone."))
                     return
@@ -453,84 +476,49 @@ final class OathListener {
     // MARK: - Recognition session
 
     private func beginSession() {
-        guard let recognizer, recognizer.isAvailable else {
-            fail(.unavailable("Speech recognition isn't available right now."))
-            return
-        }
-        guard recognizer.supportsOnDeviceRecognition else {
-            fail(.unavailable("On-device speech recognition isn't available for en-US on this Mac. Refusing to fall back to server recognition, which would send audio to Apple."))
-            return
-        }
-
-        teardownAudio()
-
-        let req = SFSpeechAudioBufferRecognitionRequest()
-        req.shouldReportPartialResults = true
-        req.requiresOnDeviceRecognition = true
-        // Bias recognition toward the corps names and the oddest lines, so the
-        // transcripts arrive closer to what was actually said.
-        req.contextualStrings = Self.contextualStrings
-        request = req
-
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0 else {
-            fail(.unavailable("No usable audio input device."))
-            return
-        }
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            req.append(buffer)
-        }
-
-        engine.prepare()
+        generation &+= 1
+        let token = generation
+        restartWork?.cancel()
+        restartWork = nil
+        input.stop()
+        guard isCurrent(token) else { return }
+        state = .listening
+        guard isCurrent(token) else { return }
         do {
-            try engine.start()
-        } catch {
-            fail(.unavailable("Couldn't start audio input: \(error.localizedDescription)"))
-            return
-        }
-
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
-            DispatchQueue.main.async {
-                guard let self, self.wantsToListen else { return }
-                if let result {
-                    let text = result.bestTranscription.formattedString
-                    if self.consider(text, finalised: result.isFinal) != nil {
-                        // The handler may have switched listening off — swearing
-                        // an oath does — and then there is nothing to restart.
-                        // Scheduling one anyway would leave a stale work item to
-                        // fire over the top of the next session the user starts.
-                        if self.wantsToListen { self.scheduleRestart(after: 1.0) }
-                        return
+            try input.start { [weak self] text, finalised, failed in
+                self?.deliver { [weak self] in
+                    guard let self, self.isCurrent(token) else { return }
+                    if let text {
+                        if self.consider(text, finalised: finalised) != nil {
+                            // The acceptance handler may have stopped or restarted
+                            // listening synchronously. It owns the resulting session.
+                            if self.isCurrent(token) { self.scheduleRestart(after: 1.0) }
+                            return
+                        }
+                        if !text.isEmpty { self.state = .heard(text) }
                     }
-                    if !text.isEmpty { self.state = .heard(text) }
-                }
-                if error != nil || (result?.isFinal ?? false) {
-                    // Tasks end on their own after silence or ~1 minute of audio;
-                    // roll straight into a fresh one.
-                    self.scheduleRestart(after: 0.3)
+                    if self.isCurrent(token), failed || finalised {
+                        self.scheduleRestart(after: 0.3)
+                    }
                 }
             }
+        } catch {
+            if isCurrent(token) { fail(.unavailable(error.localizedDescription)) }
         }
-        state = .listening
     }
 
     private func scheduleRestart(after delay: TimeInterval) {
+        // Retire the completed session immediately, not when its replacement
+        // starts. Duplicate final results and cancellation errors are obsolete.
+        generation &+= 1
+        let token = generation
         restartWork?.cancel()
+        input.stop()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.wantsToListen else { return }
+            guard let self, self.isCurrent(token) else { return }
             self.beginSession()
         }
         restartWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
-    }
-
-    private func teardownAudio() {
-        task?.cancel()
-        task = nil
-        request?.endAudio()
-        request = nil
-        if engine.isRunning { engine.stop() }
-        engine.inputNode.removeTap(onBus: 0)
+        schedule(delay, work)
     }
 }

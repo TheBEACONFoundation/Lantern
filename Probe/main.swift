@@ -1,32 +1,8 @@
 import Foundation
 import IOKit
 
-// Identifies which SMC key gates charging on this Mac, by testing candidates
-// one at a time and restoring each immediately.
-//
-// The classic Apple Silicon inhibit keys (CH0B/CH0C/CH0I) are absent on M5, so
-// the candidates below are informed guesses. Each one states its rationale, and
-// nothing is assumed about what a key means.
-//
-// Safety rules this tool holds to:
-//   * only one key is modified at a time
-//   * the original value is captured first and restored straight after
-//   * restore also runs on SIGINT/SIGTERM and on any error path
-//   * it refuses to run unless the Mac is plugged in AND actively charging,
-//     because otherwise there is no effect to observe
-//   * if charging fails to resume after a restore, it stops immediately
-
-struct Candidate {
-    let key: String
-    let test: [UInt8]
-    let why: String
-}
-
-// Enumerating every SMC key on this Mac (3,794 of them, after the OS update to
-// Darwin 27) leaves CHIE as the only writable charging control. CHTE, which an
-// earlier OS exposed, is gone. ACLC is writable but changes by itself with the
-// power source — 03 on battery, 04 while charging — so it looks like a status
-// value, not a switch; it's left out, though `--key ACLC` can still test it.
+// Tests charging-control candidates one at a time. Every write, including a
+// rejected write, is followed by a verified restoration before another test.
 let defaultCandidates = [
     Candidate(key: "CHIE", test: [0x01],
               why: "1-byte hex_ flag; 1 is the conventional 'inhibit' encoding"),
@@ -34,203 +10,201 @@ let defaultCandidates = [
               why: "same flag; CH0B used 02 to inhibit on M1–M4"),
 ]
 
-func parseHex(_ s: String) -> [UInt8]? {
-    let cleaned = s.replacingOccurrences(of: " ", with: "")
-        .replacingOccurrences(of: "0x", with: "")
-    guard cleaned.count % 2 == 0 else { return nil }
-    return stride(from: 0, to: cleaned.count, by: 2).compactMap {
-        let i = cleaned.index(cleaned.startIndex, offsetBy: $0)
-        return UInt8(cleaned[i...cleaned.index(i, offsetBy: 1)], radix: 16)
+let usage = """
+Usage: lantern-probe [--key KEY [--value HEX]]
+
+Tests the default candidates, or one four-byte ASCII SMC key. HEX must contain
+complete hexadecimal byte pairs (for example 02, 0x02, or "01 02").
+Requires root, external power, and an actively charging battery.
+"""
+
+// Parse the entire command before checking privileges or opening the SMC.
+let candidates: [Candidate]
+do {
+    switch try ProbeArguments.parse(Array(CommandLine.arguments.dropFirst()),
+                                    defaults: defaultCandidates) {
+    case .help:
+        print(usage)
+        exit(0)
+    case .run(let parsed):
+        candidates = parsed
     }
+} catch {
+    fputs("Invalid arguments: \(error)\n\n\(usage)\n", stderr)
+    exit(1)
 }
-
-// `--key CHIE --value 02` tests one specific key/value instead of the defaults.
-var candidates = defaultCandidates
-let args = CommandLine.arguments
-if let ki = args.firstIndex(of: "--key"), ki + 1 < args.count {
-    let key = args[ki + 1]
-    var value: [UInt8] = [0x01]
-    if let vi = args.firstIndex(of: "--value"), vi + 1 < args.count,
-       let parsed = parseHex(args[vi + 1]) { value = parsed }
-    candidates = [Candidate(key: key, test: value, why: "specified on the command line")]
-}
-
-func batteryState() -> (charging: Bool, plugged: Bool, current: Int, percent: Int) {
-    let service = IOServiceGetMatchingService(kIOMainPortDefault,
-                                              IOServiceMatching("AppleSmartBattery"))
-    guard service != 0 else { return (false, false, 0, 0) }
-    defer { IOObjectRelease(service) }
-    var u: Unmanaged<CFMutableDictionary>?
-    guard IORegistryEntryCreateCFProperties(service, &u, kCFAllocatorDefault, 0) == KERN_SUCCESS,
-          let p = u?.takeRetainedValue() as? [String: Any] else { return (false, false, 0, 0) }
-    return (p["IsCharging"] as? Bool ?? false,
-            p["ExternalConnected"] as? Bool ?? false,
-            p["InstantAmperage"] as? Int ?? p["Amperage"] as? Int ?? 0,
-            p["CurrentCapacity"] as? Int ?? 0)
-}
-
-func hex(_ b: [UInt8]) -> String { b.map { String(format: "%02x", $0) }.joined(separator: " ") }
-func pause(_ seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
-
-final class Restorer {
-    var pending: (key: String, bytes: [UInt8])?
-    let smc: SMC
-    init(smc: SMC) { self.smc = smc }
-    func restore(_ reason: String) {
-        guard let p = pending else { return }
-        pending = nil
-        do {
-            try smc.write(p.key, bytes: p.bytes)
-            print("  restored \(p.key) -> \(hex(p.bytes))  [\(reason)]")
-        } catch {
-            print("""
-
-              !! FAILED to restore \(p.key) to \(hex(p.bytes)): \(error)
-                 Shut the Mac down fully, wait 30s, then power it back on.
-            """)
-        }
-    }
-}
-
-// Declared before the signal handlers, which can't capture context and so
-// have to reach it as a global.
-var restorerGlobal: Restorer?
 
 guard getuid() == 0 else {
-    print("""
-    This probe writes SMC keys, so it must run as root:
-
-        sudo "\(args[0])"
-    """)
+    fputs("This probe writes SMC keys and must run as root. Run it with sudo.\n", stderr)
     exit(1)
 }
 
-let smc: SMC
-do { smc = try SMC() } catch { print("Cannot open SMC: \(error)"); exit(1) }
-let restorer = Restorer(smc: smc)
-restorerGlobal = restorer
+extension SMC: ProbeSMC {}
 
-for sig in [SIGINT, SIGTERM] {
-    signal(sig) { _ in
-        print("\n interrupted — restoring")
-        restorerGlobal?.restore("signal")
-        exit(130)
+struct BatteryState {
+    let charging: Bool
+    let plugged: Bool
+    let current: Int
+    let percent: Int
+    var activelyCharging: Bool { plugged && charging && current > 0 }
+}
+
+func batteryState() throws -> BatteryState {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault,
+                                              IOServiceMatching("AppleSmartBattery"))
+    guard service != 0 else { throw ProbeFailure("Cannot find the battery") }
+    defer { IOObjectRelease(service) }
+    var properties: Unmanaged<CFMutableDictionary>?
+    guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+          let values = properties?.takeRetainedValue() as? [String: Any],
+          let charging = values["IsCharging"] as? Bool,
+          let plugged = values["ExternalConnected"] as? Bool,
+          let current = values["InstantAmperage"] as? Int ?? values["Amperage"] as? Int,
+          let percent = values["CurrentCapacity"] as? Int else {
+        throw ProbeFailure("Cannot read the battery's charging state")
+    }
+    return BatteryState(charging: charging, plugged: plugged, current: current, percent: percent)
+}
+
+// Dispatch handlers only request interruption. All IOKit work, rollback and
+// reporting remain on this thread; no signal handler touches the SMC or Swift
+// runtime. Keep the sources alive until the process finishes.
+let interruption = ProbeInterruption()
+let signalQueue = DispatchQueue(label: "lantern.probe.signals")
+let signalSources = [SIGINT, SIGTERM].map { signalNumber -> DispatchSourceSignal in
+    signal(signalNumber, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: signalQueue)
+    source.setEventHandler { interruption.request(signalNumber) }
+    source.resume()
+    return source
+}
+
+struct Finding {
+    let key: String
+    let value: [UInt8]
+    let effect: ProbeEffect
+    let detail: String
+}
+
+var restorer: ProbeRestorer?
+var exitStatus: Int32 = 0
+
+do {
+    try interruption.check()
+    var start = try batteryState()
+    print("Battery: \(start.percent)%  plugged=\(start.plugged)  charging=\(start.charging)  current=\(start.current) mA\n")
+    guard start.plugged else {
+        throw ProbeFailure("Connect external power before probing an active charge")
+    }
+    if !start.activelyCharging {
+        print("Plugged in but not charging yet — waiting up to 20s for it to start...")
+        for _ in 0..<20 {
+            try interruption.pause(1)
+            start = try batteryState()
+            guard start.plugged else { throw ProbeFailure("External power was disconnected") }
+            if start.activelyCharging { break }
+        }
+    }
+    guard start.activelyCharging else {
+        throw ProbeFailure("Still not charging after 20s (\(start.percent)%, \(start.current) mA). Try again while the battery is actively charging")
+    }
+    try interruption.check()
+    let smc = try SMC()
+    let recovery = ProbeRestorer(smc: smc)
+    restorer = recovery
+    var findings: [Finding] = []
+    print("Charging at \(start.current) mA — starting.\n")
+
+    for candidate in candidates {
+        try interruption.check()
+        print("--- \(candidate.key) --- (\(candidate.why))")
+        let metadata: SMCKeyInfo
+        do {
+            metadata = try smc.info(candidate.key)
+        } catch {
+            print("  skipped: \(error)\n")
+            continue
+        }
+        guard metadata.isWritable else {
+            print("  skipped: firmware reports it read-only\n")
+            continue
+        }
+        guard candidate.test.count == metadata.size else {
+            print("  skipped: test value is \(candidate.test.count) bytes, key is \(metadata.size)\n")
+            continue
+        }
+        let before = try batteryState()
+        guard before.activelyCharging else {
+            throw ProbeFailure("Battery must still be plugged in and actively charging before testing \(candidate.key)")
+        }
+        try interruption.check()
+        let during = try recovery.withTestValue(key: candidate.key, value: candidate.test) {
+            try interruption.check()
+            if let original = recovery.pending?.bytes {
+                print("  size=\(metadata.size) type=\(metadata.type) attr=0x\(String(format: "%02x", metadata.attributes)) original=\(hex(original))")
+            }
+            print("  wrote \(hex(candidate.test)), observing for 4s...")
+            try interruption.pause(4)
+            return try batteryState()
+        }
+        print("  restored \(candidate.key); original value verified by readback")
+
+        // The charger may need time to reconnect and ramp back up. Both the
+        // connection and positive charging state must recover before proceeding.
+        var after = try batteryState()
+        for _ in 0..<30 {
+            if after.activelyCharging { break }
+            try interruption.pause(1)
+            after = try batteryState()
+        }
+        let effect = ProbeEffect.classify(wasCharging: before.charging, beforeCurrent: before.current,
+                                          isCharging: during.charging, duringCurrent: during.current,
+                                          isPluggedIn: during.plugged)
+        print("  before: plugged=\(before.plugged) charging=\(before.charging) current=\(before.current) mA")
+        print("  during: plugged=\(during.plugged) charging=\(during.charging) current=\(during.current) mA")
+        print("  after:  plugged=\(after.plugged) charging=\(after.charging) current=\(after.current) mA")
+        print("  => \(effect.rawValue); recovered=\(after.activelyCharging)\n")
+        guard after.activelyCharging else {
+            throw ProbeFailure("Charging did not resume within 30s of restoring \(candidate.key). Stopping here; check the cable and adapter")
+        }
+        findings.append(Finding(key: candidate.key, value: candidate.test, effect: effect,
+                                detail: "before=\(before.current)mA during=\(during.current)mA"))
+    }
+
+    try interruption.check()
+    print(String(repeating: "=", count: 62))
+    print("Comparing every tested key against its original value:")
+    for snapshot in try recovery.audit() {
+        print("  \(snapshot.key) = \(hex(snapshot.bytes)) (verified)")
+    }
+    print("")
+    let winners = findings.filter { $0.effect == .chargingStopped }
+    if winners.isEmpty {
+        print("No candidate stopped charging while leaving external power connected.")
+    } else {
+        for winner in winners {
+            print("FOUND: \(winner.key) gates charging — write \(hex(winner.value)) to inhibit. \(winner.detail)")
+        }
+    }
+    try interruption.check()
+} catch {
+    // withTestValue already attempts rollback. If that failed, keep its record
+    // and make one last verified recovery attempt, then exit without more tests.
+    fputs("\nProbe stopped: \(error)\n", stderr)
+    if let recovery = restorer, let pending = recovery.pending {
+        do {
+            try recovery.restore()
+            fputs("Restored \(pending.key) to \(hex(pending.bytes)); readback verified. No further keys will be tested.\n", stderr)
+        } catch {
+            fputs("FAILED to restore \(pending.key) to \(hex(pending.bytes)): \(error)\nRecovery remains unverified. Shut the Mac down fully, wait 30s, then power it back on.\n", stderr)
+        }
+    }
+    if let interrupted = error as? ProbeInterrupted {
+        exitStatus = 128 + interrupted.signal
+    } else {
+        exitStatus = 2
     }
 }
 
-var start = batteryState()
-// On Apple Silicon, CurrentCapacity is the charge percentage, not mAh.
-print("Battery: \(start.percent)%  plugged=\(start.plugged)  charging=\(start.charging)  current=\(start.current) mA\n")
-
-guard start.plugged else {
-    print("""
-    Not plugged in. Connect power and run this again.
-    The probe works by trying to STOP an active charge, so it needs one running.
-    """)
-    exit(1)
-}
-// Charging takes a few seconds to begin after the cable goes in, so give it a
-// moment rather than refusing straight away.
-if !(start.charging && start.current > 0) {
-    print("Plugged in but not charging yet — waiting up to 20s for it to start...")
-    for _ in 0..<20 {
-        pause(1)
-        start = batteryState()
-        if start.charging && start.current > 0 { break }
-    }
-}
-guard start.charging, start.current > 0 else {
-    print("""
-    Still not charging after 20s (\(start.percent)%, \(start.current) mA).
-    macOS won't top up a battery that's nearly full; below about 85% it always
-    charges. If it's lower than that, check the cable and adapter.
-    """)
-    exit(1)
-}
-print("Charging at \(start.current) mA — starting.\n")
-
-struct Finding { let key: String; let value: [UInt8]; let stopped: Bool; let detail: String }
-var findings: [Finding] = []
-
-for c in candidates {
-    print("--- \(c.key) --- (\(c.why))")
-    let meta: SMCKeyInfo
-    let original: [UInt8]
-    do {
-        meta = try smc.info(c.key)
-        original = try smc.read(c.key)
-    } catch { print("  skipped: \(error)\n"); continue }
-
-    guard meta.isWritable else { print("  skipped: firmware reports it read-only\n"); continue }
-    guard c.test.count == meta.size else {
-        print("  skipped: test value is \(c.test.count) bytes, key is \(meta.size)\n"); continue
-    }
-    print("  size=\(meta.size) type=\(meta.type) attr=0x\(String(format: "%02x", meta.attributes)) original=\(hex(original))")
-
-    let before = batteryState()
-    restorer.pending = (c.key, original)
-    do {
-        try smc.write(c.key, bytes: c.test)
-        print("  wrote \(hex(c.test)), observing for 4s...")
-    } catch {
-        print("  write rejected: \(error)\n")
-        restorer.pending = nil
-        continue
-    }
-
-    pause(4)
-    let during = batteryState()
-    restorer.restore("test complete")
-    // Charging takes several seconds to ramp back up once the inhibit clears —
-    // on the first real run it hadn't restarted after 3s but had within a
-    // minute — so poll for up to 30s before calling it a failure.
-    var after = batteryState()
-    for _ in 0..<30 where !(after.charging || after.current > 0) {
-        pause(1)
-        after = batteryState()
-    }
-
-    let stopped = (before.charging && !during.charging)
-        || (before.current > 200 && during.current <= 0)
-    let recovered = after.charging || after.current > 0
-
-    print("  before: charging=\(before.charging) current=\(before.current) mA")
-    print("  during: charging=\(during.charging) current=\(during.current) mA")
-    print("  after:  charging=\(after.charging) current=\(after.current) mA")
-    print("  => \(stopped ? "CHARGING STOPPED" : "no effect on charging"); recovered=\(recovered)\n")
-
-    if !recovered {
-        print("""
-          !! Charging did not resume within 30s of restoring \(c.key).
-             Stopping here. Try unplugging and plugging back in first; if it
-             still won't charge, shut down fully, wait 30s, and power on.
-        """)
-        exit(2)
-    }
-    findings.append(Finding(key: c.key, value: c.test, stopped: stopped,
-                            detail: "before=\(before.current)mA during=\(during.current)mA"))
-}
-
-// Final audit: every key back where it started.
-print(String(repeating: "=", count: 62))
-print("Verifying all candidates are back at their original values:")
-for key in Set(candidates.map(\.key)).sorted() {
-    if let v = try? smc.read(key) { print("  \(key) = \(hex(v))") }
-}
-print("")
-
-let winners = findings.filter(\.stopped)
-if winners.isEmpty {
-    print("""
-    No candidate gated charging.
-
-    None of \(candidates.map(\.key).joined(separator: ", ")) stopped the charge.
-    Charge control doesn't look reachable through these keys on this Mac. The
-    oath still works — it just won't be able to hold the cable back.
-    """)
-} else {
-    for w in winners {
-        print("FOUND: \(w.key) gates charging — write \(hex(w.value)) to inhibit. \(w.detail)")
-    }
-    print("\nTell Claude which key won and it'll wire the oath to it.")
-}
+withExtendedLifetime(signalSources) {}
+exit(exitStatus)

@@ -1,10 +1,12 @@
 import Foundation
+import Speech
 
 /// Exercises the oath matcher without a microphone.
 /// Run with `Lantern --test-oath`.
 enum OathMatchTests {
 
     private typealias Corps = LanternGlyph.Emblem
+    private static var executedCases = 0
 
     /// `expect` is the corps the transcript should swear the lantern to, or
     /// nil for a transcript that must not trip any oath.
@@ -128,10 +130,10 @@ enum OathMatchTests {
         // What a recogniser actually returns, the alien words as noise.
         ("tore lore ex an bore knock a mur not romo fon tornic what er ter lantern curl oh abin sur tan lek lek nok for morrow sir",
          .indigo, "indigo: the alien words heard as noise"),
-        ("for morrow sir", .indigo, "indigo: the one line it turns on, alone"),
-        ("for tomorrow sir", .indigo, "indigo: \"formorrow\" heard as \"tomorrow\""),
-        ("formorrow sur", .indigo, "indigo: run together, spelled \"sur\""),
-        ("for morrow sure", .indigo, "indigo: \"sur\" heard as \"sure\""),
+        ("lantern for morrow sir", .indigo, "indigo: closing plus an earlier word"),
+        ("abin sur for tomorrow sir", .indigo, "indigo: \"formorrow\" heard as \"tomorrow\""),
+        ("lantern formorrow sur", .indigo, "indigo: run together, spelled \"sur\""),
+        ("lantern for morrow sure", .indigo, "indigo: \"sur\" heard as \"sure\""),
 
         // MARK: No oath must answer for another.
         ("In brightest day, in blackest night, no evil shall escape my sight. Let those who worship evil's might beware my power — Green Lantern's light!",
@@ -172,13 +174,25 @@ enum OathMatchTests {
         ("for those alone in blackest night", nil, "sapphire: a line it shares, alone"),
         ("love conquers all", nil, "sapphire: clincher alone"),
         ("accept our ring and join our fight", nil, "sapphire: two phrases"),
-        // The Indigo bar is one phrase, which is as low as it goes — so what
-        // keeps it shut matters. "Morrow" alone isn't enough, and neither is
-        // the everyday word it gets heard as.
+        // Indigo needs an explicit closing variant and earlier oath evidence.
         ("tomorrow", nil, "indigo: \"tomorrow\" on its own"),
         ("see you tomorrow then", nil, "indigo: \"tomorrow\" in ordinary speech"),
         ("good morrow", nil, "indigo: \"morrow\" without what follows it"),
         ("ter lantern ker lo abin sur", nil, "indigo: the line before it, alone"),
+        ("for morrow sir", nil, "indigo: closing alone lacks earlier oath evidence"),
+        ("for tomorrow sir", nil, "indigo: an ordinary closing phrase alone"),
+        ("Tomorrow surely will be better.", nil, "indigo: surely is not sure"),
+        ("I have an appointment tomorrow surgery starts at nine.", nil,
+         "indigo: surgery is not sur"),
+        ("the lantern will arrive tomorrow surely", nil,
+         "indigo: earlier evidence must not relax closing word boundaries"),
+        ("lantern formorrow surface", nil, "indigo: surface is not sur"),
+        ("mine and mine and mine not yours determine examine", nil,
+         "orange: fragments inside other words do not count as mine"),
+        ("mine and mine and mine not yours mines miners", nil,
+         "orange: plural and suffixed forms are not the refrain"),
+        ("brightest day blackest night escape my sight green lanternfish", nil,
+         "green: an arbitrary suffix cannot supply the clincher"),
     ]
 
     /// Normalisation has to collapse possessives the way the phrase lists spell
@@ -194,12 +208,14 @@ enum OathMatchTests {
     ]
 
     static func run() -> Int {
+        executedCases = 0
         var failures = 0
 
         print("normalisation")
         for (input, expected) in normalisationCases {
             let got = OathListener.normalize(input)
             let ok = got == expected
+            executedCases += 1
             if !ok { failures += 1 }
             print("  \(ok ? "ok  " : "FAIL") \"\(input)\" -> \"\(got)\"\(ok ? "" : "  (expected \"\(expected)\")")")
         }
@@ -208,6 +224,7 @@ enum OathMatchTests {
         for c in cases {
             let got = OathListener.match(c.text)?.corps
             let ok = got == c.expect
+            executedCases += 1
             if !ok { failures += 1 }
             print("  \(ok ? "ok  " : "FAIL") expect=\(describe(c.expect)) got=\(describe(got))  \(c.note)")
         }
@@ -218,6 +235,7 @@ enum OathMatchTests {
         for oath in OathListener.oaths {
             let got = OathListener.match(oath.text)?.corps
             let ok = got == oath.corps
+            executedCases += 1
             if !ok { failures += 1 }
             print("  \(ok ? "ok  " : "FAIL") \(oath.name) -> \(describe(got))")
         }
@@ -226,6 +244,7 @@ enum OathMatchTests {
         for (text, expected, note) in nameCases {
             let got = OathListener.heardName("sinestro", in: OathListener.normalize(text))
             let ok = got == expected
+            executedCases += 1
             if !ok { failures += 1 }
             print("  \(ok ? "ok  " : "FAIL") expect=\(expected) got=\(got)  \(note)")
         }
@@ -242,8 +261,10 @@ enum OathMatchTests {
         let gateFailures = runGate()
         failures += gateFailures
 
-        let total = cases.count + normalisationCases.count + nameCases.count
-            + OathListener.oaths.count + gateCases + acceptCases + batteryCases
+        print("\nspeech lifecycle")
+        failures += runLifecycle()
+
+        let total = executedCases
         print(failures == 0 ? "\nall \(total) cases pass" : "\n\(failures) of \(total) FAILED")
         return failures
     }
@@ -262,15 +283,13 @@ enum OathMatchTests {
         ("sin", false, "a fragment on its own"),
     ]
 
-    private static let acceptCases = 8
-    private static let batteryCases = 14
-
     /// The path the microphone drives: a transcript goes in, and an oath that
     /// lands fires `onAccepted` exactly once with the corps it swore to.
     /// Anything short of an oath must fire nothing at all.
     private static func runAccept() -> Int {
         var failures = 0
         func check(_ ok: Bool, _ note: String) {
+            executedCases += 1
             if !ok { failures += 1 }
             print("  \(ok ? "ok  " : "FAIL") \(note)")
         }
@@ -296,13 +315,49 @@ enum OathMatchTests {
         let paused = OathListener()
         var sworn: [Corps] = []
         paused.onAccepted = { sworn.append($0.corps) }
-        let first = paused.consider("in blackest day in brightest night", finalised: true)
+        let opening = "in blackest day in brightest night"
+        let closing = "burn like my power sinestros might"
+        check(OathListener.match(opening) == nil && OathListener.match(closing) == nil,
+              "both split-oath halves individually fall short")
+        let first = paused.consider(opening, finalised: true)
         check(first == nil && sworn.isEmpty, "half an oath alone lands nothing")
-        let second = paused.consider(
-            "beware your fears made into light let those who try to stop whats right burn like my power sinestros might",
-            finalised: true)
+        let second = paused.consider(closing, finalised: true)
         check(second?.corps == .sinestro && sworn == [.sinestro],
               "the rest of it, after a pause, completes the oath")
+
+        // A later fragment cannot refresh the age of earlier speech.
+        var time: TimeInterval = 0
+        let expiring = OathListener(now: { time })
+        expiring.consider("brightest day blackest night", finalised: true)
+        time = 20
+        expiring.consider("yes", finalised: true)
+        time = 40
+        expiring.consider("yes", finalised: true)
+        time = 60
+        check(expiring.consider("escape my sight green lantern", finalised: true) == nil,
+              "unrelated speech cannot preserve a minute-old oath fragment")
+
+        time = 0
+        let boundary = OathListener(now: { time })
+        boundary.consider(opening, finalised: true)
+        time = 25
+        check(boundary.consider(closing) == nil, "fragments expire at 25 seconds")
+
+        time = 0
+        let fresh = OathListener(now: { time })
+        fresh.consider(opening, finalised: true)
+        time = 24.9
+        check(fresh.consider(closing)?.corps == .sinestro,
+              "fragments just within 25 seconds still combine")
+
+        time = 0
+        let mixedAges = OathListener(now: { time })
+        mixedAges.consider("irrelevant", finalised: true)
+        time = 20
+        mixedAges.consider(opening, finalised: true)
+        time = 30
+        check(mixedAges.consider(closing)?.corps == .sinestro,
+              "expiring an older segment preserves newer useful speech")
 
         // And what was carried must not survive being switched off.
         let reset = OathListener()
@@ -313,14 +368,13 @@ enum OathMatchTests {
         return failures
     }
 
-    private static let gateCases = 7
-
-    /// The charge picks three corps and only three. Orange is reachable by
+    /// The charge picks its battery tiers. Orange is reachable by
     /// swearing its oath and by nothing else — including a battery at any
     /// level, charging or not.
     private static func runBattery() -> Int {
         var failures = 0
         func check(_ ok: Bool, _ note: String) {
+            executedCases += 1
             if !ok { failures += 1 }
             print("  \(ok ? "ok  " : "FAIL") \(note)")
         }
@@ -364,6 +418,7 @@ enum OathMatchTests {
     private static func runGate() -> Int {
         var failures = 0
         func check(_ ok: Bool, _ note: String) {
+            executedCases += 1
             if !ok { failures += 1 }
             print("  \(ok ? "ok  " : "FAIL") \(note)")
         }
@@ -389,6 +444,26 @@ enum OathMatchTests {
                 == .green, "released, a 90% charge is green again")
         check(LanternGlyph.palette(level: 0.05, charging: false, sworn: charge.sworn).emblem
                 == .red, "released, a flat charge is red again")
+        charge.swear(to: .blue)
+        let plugged = BatteryInfo(hasBattery: true, isPluggedIn: true)
+        let unplugged = BatteryInfo(hasBattery: true, isPluggedIn: false)
+        charge.batteryChanged(from: plugged, to: plugged)
+        check(charge.gate == .open && charge.sworn == .blue,
+              "battery updates while plugged in preserve the oath")
+        charge.batteryChanged(from: plugged, to: unplugged)
+        check(charge.gate == .sealed && charge.sworn == nil, "unplugging releases the oath")
+        charge.batteryChanged(from: unplugged, to: plugged)
+        check(charge.gate == .sealed && charge.sworn == nil, "replugging requires a new oath")
+        return failures
+    }
+
+    private static func runLifecycle() -> Int {
+        var failures = 0
+        OathLifecycleTests.run { ok, note in
+            executedCases += 1
+            if !ok { failures += 1 }
+            print("  \(ok ? "ok  " : "FAIL") \(note)")
+        }
         return failures
     }
 

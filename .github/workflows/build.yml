@@ -24,9 +24,16 @@ jobs:
         run: ./build.sh
 
       - name: Oath, gate and battery-tier cases
-        # 137 cases, no microphone and no display needed — the flag returns
+        # No microphone or display needed — the flag returns
         # before AppKit is ever brought up.
         run: build/Lantern.app/Contents/MacOS/Lantern --test-oath
+
+      - name: Probe argument and recovery cases
+        # Fake SMC only: never opens hardware or requires root.
+        run: ./test-probe.sh
+
+      - name: Animation and Reduce Motion cases
+        run: ./Tests/test-rendering.sh
 
       - name: Renderers
         # A smoke test that every emblem still draws. Catches a bad path or a

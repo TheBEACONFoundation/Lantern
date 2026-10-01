@@ -124,6 +124,11 @@ stall and fade short of the hub while the lantern is sealed, and the oath
 throws a burst outward. They're Core Animation emitters, so they cost the app
 nothing. Turn them off with **Particle Effects** in the menu.
 
+Lantern also follows macOS **Reduce Motion** in Accessibility settings. When
+it is enabled, the battery level and charging state remain visible without
+moving surfaces, particles, pulses, sweeps or arrival flourishes. Changes to
+the setting take effect while Lantern is running.
+
 **Each corps' light behaves as its own.** The motes coming off the charge are
 the corps, not the colour of one:
 
@@ -173,7 +178,7 @@ icons on plain menu items, so the menu doesn't try.)
 
 ## The Oaths
 
-Three corps, three oaths. Say one and the lantern flares — a shockwave, a
+Nine corps, nine oaths. Say one and the lantern flares — a shockwave, a
 bloom spike, the sealed lantern opens — and **swears to that corps**: it
 dissolves into that figure and colour and stays there, whatever the battery
 says, until you seal it again.
@@ -231,6 +236,7 @@ is red.
 
 Turn it on with **Listen for the Oath** in the menu. macOS will ask for
 microphone and speech recognition permission the first time.
+**View All Oaths…** opens a selectable reference with all nine recitations.
 
 **Listening switches itself off the moment an oath lands.** An oath is said
 once to change the lantern, not held open afterwards — leaving the microphone
@@ -262,7 +268,7 @@ distinctive phrases, four of which must land. Half an oath won't do it.
 | White Lantern | *cleanse the soul* or *set wrongs right* or *new dawn comes* or *let there be light* | cleanse the soul · set wrongs right · darkness falls · look to the skies · new dawn comes · let there be light |
 | Blue Lantern | *war of light* or *souls ignite* or *hope burns bright* or *strong hearts full* | fearful day · raging night · souls ignite · war of light · look to the stars · hope burns bright |
 | Star Sapphire | *love conquers all* or *violet light* or *accept our ring* or *hearts long lost* | hearts long lost · full of fright · accept our ring · join our fight · love conquers all · violet light |
-| Indigo Tribe | *morrow sir* or *morrow sur* or *morrow sure* | one of the above is enough — see below |
+| Indigo Tribe | *formorrow*, *for morrow* or *tomorrow*, followed by *sir*, *sur* or *sure* | the closing phrase plus *lantern* or *Abin Sur* — see below |
 
 The pool is six but the bar stays at four, so two clauses can be misheard
 without sinking the oath. Some details that earn their keep:
@@ -310,21 +316,20 @@ transcripts arrive closer to what was actually said in the first place.
 of silence, and the next one starts from an empty transcript — so an oath
 recited a line at a time used to arrive in pieces, none of which was an oath.
 Each finished piece is now carried for 25 seconds and matched together with
-what follows. Switching listening off drops what was carried, so the next oath
-starts from silence.
+what follows. Pieces expire individually: new speech does not extend the life
+of old fragments. Switching listening off drops what was carried, so the next
+oath starts from silence. Callbacks from a previous listening session cannot
+affect a newer one.
 
 **The Indigo Tribe's oath isn't in any language a recogniser knows.** Nine
-words in ten come back as noise, so there is no coverage to measure: the whole
-of the match is its last line, *Formorrow Sur*, which arrives as "for morrow
-sir" or near enough. Its bar is therefore one phrase, where every other oath
-needs four. The three spellings it accepts — *sir*, *sur*, *sure* — are what
-the recogniser actually reaches for, and each of them still contains "morrow
-s…" whether or not the "for" runs into the word before it, and whether or not
-"formorrow" comes back as the everyday "tomorrow".
+words in ten come back as noise, so its match uses two recognizable parts:
+*lantern* or *Abin Sur*, and the closing line, *Formorrow Sur*. The closing
+line accepts *formorrow*, *for morrow* or *tomorrow*, followed by the whole
+word *sir*, *sur* or *sure*. The closing line alone is not enough.
 
-A bar of one is as low as it goes, so what keeps it shut is worth stating:
-"morrow" on its own doesn't open it, and neither does "tomorrow" in ordinary
-speech. It needs the word that follows. There are tests for each.
+These are complete words, so ordinary phrases such as "tomorrow surely" or
+"tomorrow surgery" do not trigger Indigo. Regression tests cover those
+phrases, the recognized variants, and recitations split across sessions.
 
 **The Orange Lantern oath is counted, not covered.** It is almost entirely one
 word repeated, so there are no six distinct phrases to find. Its refrain
@@ -333,6 +338,9 @@ is said — and that count is mandatory, which is what stops the very ordinary
 words it's built from tripping the gate. Only two of its three phrases are
 then needed. Nothing else the Mac is likely to overhear says "mine" five times
 in one breath.
+Only the complete word "mine" counts; words such as "determine" and
+"examine" do not add to the refrain. Phrase matching also respects word
+boundaries.
 
 Every oath is scored rather than the first match winning, so a recitation that
 trips two of them swears you to the one it covers best.
@@ -344,12 +352,18 @@ Exercise the matcher, and the rule that sealing releases the corps, without a
 microphone:
 
 ```bash
-/Applications/Lantern.app/Contents/MacOS/Lantern --test-oath
+build/Lantern.app/Contents/MacOS/Lantern --test-oath
+./test-probe.sh
+./Tests/test-rendering.sh
 ```
 
-That also checks each oath's own written text — the words in the menu and this
-README — still swears to its own corps, so the phrase lists can't drift away
-from the oath they're meant to recognise.
+The oath suite also checks each oath's own written text — the words in the
+reference and this README — still swears to its own corps, so the phrase lists
+can't drift away from the oath they're meant to recognise. Permission and
+recognition lifecycle tests use a fake speech input, and the probe tests use a
+fake SMC: neither suite accesses a microphone or writes hardware. The rendering
+suite checks transitions, Reduce Motion and the oath reference using an
+isolated AppKit window.
 
 ## Charge control
 
@@ -388,9 +402,15 @@ to resume:
 sudo ~/Developer/Lantern/build/lantern-probe
 ```
 
-It reports whether charging *stopped*, not how — which is exactly the gap that
-hid `CHIE` cutting the charger rather than the charge. Watch `ExternalConnected`
-in `ioreg -rn AppleSmartBattery` alongside it if you try a new key.
+The probe distinguishes the charger being disconnected from charge-only
+inhibition. Every restoration is read back and compared with the original;
+a failed restoration stops further tests. Interrupt cleanup happens on the
+same execution path as the writes, and the final audit compares all tested
+keys with their saved originals.
+
+For a specific test, use `--key CHIE --value 02`. Keys must be four ASCII
+bytes and values must contain complete hexadecimal byte pairs. Invalid or
+missing arguments are rejected before accessing the SMC.
 
 ## Controls
 
@@ -406,7 +426,8 @@ Right-click (or Control-click) the emblem, or click the menu-bar icon:
 | Percentage in Menu Bar | the number beside the menu-bar icon |
 | Size | a slider with four stops: 140 / 190 / 260 / 340 pt |
 | Opacity | a slider, 30–100%, applied live |
-| Listen for the Oath | on-device speech recognition for all three oaths; switches itself off once an oath lands |
+| View All Oaths… | a selectable reference with all nine oaths |
+| Listen for the Oath | on-device speech recognition for all nine oaths; switches itself off once an oath lands |
 | Seal the Lantern | seal the gate and release the sworn corps, as unplugging does |
 | Reset Position | back to the middle of the screen |
 | Launch at Login | registers via `SMAppService` |
@@ -463,17 +484,23 @@ transition for the same reason.
 
 | File | |
 |---|---|
-| `Sources/LanternGlyph.swift` | all three emblems' geometry in unit coordinates, plus the palette |
+| `Sources/LanternGlyph.swift` | all nine emblems' geometry in unit coordinates, plus the palette |
 | `Sources/LanternRenderer.swift` | the Core Graphics drawing: the menu-bar icon, the app icon, and the source of `LanternArt` |
 | `Sources/LanternView.swift` | the desktop widget's layer tree, its animations and emitters, hit testing |
 | `Sources/LanternArt.swift` | the static artwork the layer tree displays |
 | `Sources/DesktopWindow.swift` | the transparent panel and its window level |
 | `Sources/BatteryMonitor.swift` | IOKit power sources + the `AppleSmartBattery` registry |
-| `Sources/OathListener.swift` | the three oaths, on-device speech recognition and matching |
+| `Sources/OathListener.swift` | the nine oaths, on-device speech recognition and matching |
+| `Sources/OathSpeechInput.swift` | the speech and audio boundary, replaced by a fake input in lifecycle tests |
+| `Sources/OathReferenceWindow.swift` | the in-app reference built from the canonical oath text |
 | `Sources/ChargeController.swift` | the lantern's gate, and which corps an oath swore it to |
 | `Sources/SMC.swift` | AppleSMC client, shared by the app and the probe |
 | `Sources/OathMatchTests.swift` | matcher and gate cases, run via `--test-oath` |
+| `Sources/OathLifecycleTests.swift` | delayed callback and permission cases using a fake speech input |
 | `Probe/main.swift` | the self-restoring charge-key probe |
+| `Probe/ProbeSupport.swift` | strict argument parsing, restoration and verification |
+| `Tests/Probe/main.swift` | probe argument, restoration and interruption cases using a fake SMC |
+| `Tests/Rendering/main.swift` | animation, Reduce Motion and oath reference checks |
 | `Sources/AppDelegate.swift` | status item, menu, wiring |
 | `Sources/Settings.swift` | `UserDefaults` preferences |
 | `Sources/IconExporter.swift` | renders the app icon from the live renderer |
