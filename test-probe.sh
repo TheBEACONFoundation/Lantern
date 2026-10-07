@@ -7,6 +7,7 @@ trap 'rm -rf "$test_dir"' EXIT
 
 xcrun swiftc \
   -swift-version 5 \
+  -target arm64-apple-macos13.0 \
   -module-cache-path "$test_dir/module-cache" \
   Probe/ProbeSupport.swift Tests/Probe/main.swift \
   -o "$test_dir/probe-tests"
@@ -16,6 +17,7 @@ xcrun swiftc \
 # commands return before privilege checks, SMC initialization or hardware access.
 xcrun swiftc \
   -swift-version 5 \
+  -target arm64-apple-macos13.0 \
   -module-cache-path "$test_dir/module-cache" \
   -framework IOKit \
   Sources/SMC.swift Probe/ProbeSupport.swift Probe/main.swift \

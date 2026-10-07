@@ -43,10 +43,11 @@ final class OathReferenceWindowController: NSWindowController {
             ]))
         }
         append("The Lantern Oaths", size: 24, weight: .semibold)
-        append("Switch on Listen for the Oath in the menu, then recite an oath below. "
-               + "Listening switches off when an oath is accepted. Seal the Lantern releases "
-               + "the chosen corps; unplugging releases it too. The oath changes the emblem, "
-               + "while your battery continues charging normally.")
+        append("Turn on the switch under The Oath in the menu, then recite one of the oaths "
+               + "below. Listening switches itself off once an oath is accepted. Choose "
+               + "\u{201C}Seal the Lantern\u{201D} to release the corps, or unplug — that "
+               + "releases it too. An oath changes only the emblem; your battery keeps "
+               + "charging normally.")
         for oath in OathListener.oaths {
             append(oath.name, size: 17, weight: .semibold)
             append(oath.text)

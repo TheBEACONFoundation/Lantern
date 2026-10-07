@@ -67,9 +67,11 @@ final class OathListener {
                  Green Lantern's light!
                  """,
              spokenName: nil,   // two ordinary words; recognition gets them
-             clinchers: ["green lantern"],
+             // `normalize` drops the apostrophe, so the written "Lantern's" arrives
+             // as "lanterns"; recognition often drops the possessive altogether.
+             clinchers: ["green lantern", "green lanterns"],
              phrases: ["brightest day", "blackest night", "escape my sight",
-                       "evils might", "beware my power", "green lantern"],
+                       "evils might", "beware my power", "green lantern", "green lanterns"],
              required: 4),
 
         // Two things conspire against this one. Its opening inverts the Green
@@ -233,7 +235,11 @@ final class OathListener {
     private var generation: UInt = 0
 
     init(input: OathSpeechInput = SystemOathSpeechInput(),
-         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         // CLOCK_MONOTONIC keeps counting while the Mac sleeps; `systemUptime`
+         // doesn't, which would let a fragment outlive its window across a sleep.
+         now: @escaping () -> TimeInterval = {
+             TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000_000
+         },
          deliver: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
          schedule: @escaping (TimeInterval, DispatchWorkItem) -> Void = {
              DispatchQueue.main.asyncAfter(deadline: .now() + $0, execute: $1)
@@ -324,12 +330,10 @@ final class OathListener {
         haystack.split(separator: " ").filter { $0 == needle }.count
     }
 
+    /// Whole words only: "green lantern" is not in "green lanternfish". Any
+    /// alternative spelling belongs in the oath's own lists, not here.
     private static func containsPhrase(_ phrase: String, in normalized: String) -> Bool {
-        let padded = " " + normalized + " "
-        if padded.contains(" " + phrase + " ") { return true }
-        // Normalisation drops the apostrophe in the canonical "Lantern's".
-        // Accept that one explicit spelling without allowing arbitrary suffixes.
-        return phrase == "green lantern" && padded.contains(" green lanterns ")
+        (" " + normalized + " ").contains(" " + phrase + " ")
     }
 
     /// How much of an oath a transcript covers: its phrases, plus its name if

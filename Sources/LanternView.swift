@@ -377,15 +377,22 @@ final class LanternView: NSView {
                                                      emblem: p.emblem))
         }
 
-        art(emberLayer, LanternArt.ember(canvas: canvas, scale: s, palette: p))
         art(glowLayer, LanternArt.glow(canvas: canvas, scale: s, level: level, palette: p))
         art(coreLayer, LanternArt.core(canvas: canvas, scale: s, level: level, palette: p))
-        art(coreFlashLayer, LanternArt.coreFlash(canvas: canvas, scale: s, palette: p))
-        art(heldLayer, LanternArt.heldRing(canvas: canvas, scale: s, palette: p))
-        art(glintLayer, LanternArt.glint(canvas: canvas, scale: s, palette: p))
-        art(sweepHaloLayer, LanternArt.sweepHalo(canvas: canvas, scale: s, palette: p))
-        art(sweepLayer, LanternArt.sweep(canvas: canvas, scale: s, palette: p,
-                                         comet: mode == .charging))
+        // These depend on the palette alone, which follows the corps, so a
+        // change of level leaves them exactly as they are.
+        if geometryChanged || figureChanged {
+            art(emberLayer, LanternArt.ember(canvas: canvas, scale: s, palette: p))
+            art(coreFlashLayer, LanternArt.coreFlash(canvas: canvas, scale: s, palette: p))
+            art(heldLayer, LanternArt.heldRing(canvas: canvas, scale: s, palette: p))
+            art(glintLayer, LanternArt.glint(canvas: canvas, scale: s, palette: p))
+            art(sweepHaloLayer, LanternArt.sweepHalo(canvas: canvas, scale: s, palette: p))
+        }
+        // The comet is drawn only while charging, which `key.charging` tracks.
+        if geometryChanged || figureChanged || previous?.charging != key.charging {
+            art(sweepLayer, LanternArt.sweep(canvas: canvas, scale: s, palette: p,
+                                             comet: mode == .charging))
+        }
 
         // The charge: one period wider than the canvas so it can slide by a
         // period and loop without a seam.

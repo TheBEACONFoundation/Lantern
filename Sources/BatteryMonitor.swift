@@ -92,8 +92,9 @@ final class BatteryMonitor {
               let list = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [CFTypeRef]
         else { return out }
 
+        // A Get-rule function: the string isn't ours to release.
         out.isPluggedIn = (IOPSGetProvidingPowerSourceType(blob)?
-            .takeRetainedValue() as String?) == kIOPSACPowerValue
+            .takeUnretainedValue() as String?) == kIOPSACPowerValue
 
         for source in list {
             guard let desc = IOPSGetPowerSourceDescription(blob, source)?
